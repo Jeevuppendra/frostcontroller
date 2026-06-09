@@ -1,0 +1,7 @@
+{
+  "camera_index": 0,
+  "controller_ip": "192.168.0.100",
+  "controller_port": "80",
+  "heartbeat_enabled": true,
+  "heartbeat_interval": 5
+}
