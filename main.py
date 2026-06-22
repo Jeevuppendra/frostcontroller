@@ -8,6 +8,7 @@ import queue
 import json
 import os
 import time
+import websocket
 
 # ---------- Persistent configuration ----------
 CONFIG_FILE = "config.json"
@@ -15,11 +16,12 @@ CONFIG_FILE = "config.json"
 def load_config():
     """Load settings from JSON file, or use defaults."""
     default = {
-        "camera_index": 0,                     # USB camera device index
-        "controller_ip": "192.168.1.101",
-        "controller_port": "80",
-        "heartbeat_enabled": False,
-        "heartbeat_interval": 5
+    "camera_index": 0,
+    "camera_url": "rtsp://192.168.1.101:8554/camera",
+    "controller_ip": "192.168.1.101",
+    "controller_port": "80",
+    "heartbeat_enabled": False,
+    "heartbeat_interval": 5
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -34,6 +36,7 @@ def save_config():
     """Write current global settings to JSON."""
     cfg = {
         "camera_index": camera_index_value,
+        "camera_url": camera_url_value,
         "controller_ip": controller_ip_value,
         "controller_port": controller_port_value,
         "heartbeat_enabled": heartbeat_enabled,
@@ -45,6 +48,7 @@ def save_config():
 # Load saved settings at startup
 config = load_config()
 camera_index_value = config["camera_index"]
+camera_url_value = config["camera_url"]
 controller_ip_value = config["controller_ip"]
 controller_port_value = config["controller_port"]
 heartbeat_enabled = config["heartbeat_enabled"]
@@ -60,14 +64,31 @@ frame_queue = queue.Queue(maxsize=1)   # only keep latest frame
 
 heartbeat_running = False
 heartbeat_after_id = None
+ws = None
+#WebSocket connection with the ESP32 controller
+def connect_websocket():
+    global ws
+    try:
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://{controller_ip_value}:{controller_port_value}/ws")
+    except Exception as e:
+        print(f"Error connecting to WebSocket: {e}")
+
 
 # ---------- Thread‑safe bottle commands ----------
+#Bottle control command to the ESP32 using WebSocket.
 def send_bottle_command(cmd):
     def task():
-        url = f"http://{controller_ip_value}:{controller_port_value}/control?cmd={cmd}"
+        global ws
         try:
-            resp = requests.get(url, timeout=5)
-            root.after(0, lambda: update_bottle_status(resp.ok, cmd, resp.text))
+            # Connect if WebSocket is not connected
+            if ws is None:
+                connect_websocket()
+            # Send command to ESP32
+            ws.send(cmd)
+            # Receive response from ESP32
+            response = ws.recv()
+            root.after(0, lambda: update_bottle_status(True, cmd, response))
         except Exception as e:
             root.after(0, lambda e=e: show_network_error(e))
     threading.Thread(target=task, daemon=True).start()
@@ -107,20 +128,30 @@ def stop_heartbeat():
     heartbeat_status.config(text="Heartbeat: OFF", bg="gray")
 
 def do_heartbeat():
-    global heartbeat_after_id
+    global heartbeat_after_id, ws
+
     if not heartbeat_running:
         return
-
+    
     def check():
-        url = f"http://{controller_ip_value}:{controller_port_value}/"
         try:
-            resp = requests.get(url, timeout=2)
-            root.after(0, lambda: heartbeat_status.config(text="Heartbeat: OK ✅", bg="green"))
-        except:
-            root.after(0, lambda: heartbeat_status.config(text="Heartbeat: FAIL ❌", bg="red"))
+            # Connect to WebSocket if not already connected
+            if ws is None:
+                connect_websocket()
+            # Send heartbeat message
+            ws.send("heartbeat")
+            # Wait for ESP32 response
+            response = ws.recv()
+            if response:
+                root.after(0, lambda: heartbeat_status.config(
+                    text="Heartbeat: OK ✅", bg="green"))
+        except Exception:
+            root.after(0, lambda: heartbeat_status.config(
+                text="Heartbeat: FAIL ❌", bg="red"))
 
     threading.Thread(target=check, daemon=True).start()
-    heartbeat_after_id = root.after(heartbeat_interval * 1000, do_heartbeat)
+    heartbeat_after_id = root.after(
+        heartbeat_interval * 1000, do_heartbeat)
 
 # ---------- USB webcam reader thread (non‑blocking) ----------
 def camera_reader_thread():
@@ -128,7 +159,7 @@ def camera_reader_thread():
     # Use the configured camera index (e.g. 0 for first USB webcam)
     while camera_running:
         if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(camera_index_value)
+            cap = cv2.VideoCapture(camera_url_value)
             if not cap.isOpened():
                 root.after(0, lambda: camera_status.config(text="Reconnecting... 🔄", bg="orange"))
                 root.after(0, lambda: camera_placeholder.config(image="", text="NO CAMERA\nCheck index & connection"))
@@ -229,11 +260,11 @@ def open_admin_panel():
              font=("Arial", 20, "bold")).pack(pady=15)
 
     # USB Camera Index instead of IP
-    tk.Label(admin, text="USB Camera Index (0,1,2,…)", bg="#101820", fg="white",
-             font=("Arial", 12)).pack()
-    camera_index_entry = tk.Entry(admin, font=("Arial", 12), width=10)
-    camera_index_entry.insert(0, str(camera_index_value))
-    camera_index_entry.pack(pady=5)
+    tk.Label(admin, text="Camera RTSP URL", bg="#101820", fg="white",
+         font=("Arial", 12)).pack()
+    camera_url_entry = tk.Entry(admin, font=("Arial", 12), width=35)
+    camera_url_entry.insert(0, camera_url_value)
+    camera_url_entry.pack(pady=5)
 
     tk.Label(admin, text="Bottle Controller IP", bg="#101820", fg="white",
              font=("Arial", 12)).pack()
@@ -263,21 +294,17 @@ def open_admin_panel():
     hb_interval_entry.pack(pady=5)
 
     def save_settings():
-        global camera_index_value, controller_ip_value, controller_port_value
+        global camera_url_value, controller_ip_value, controller_port_value
         global heartbeat_enabled, heartbeat_interval
 
-        try:
-            new_cam_idx = int(camera_index_entry.get().strip())
-        except ValueError:
-            messagebox.showerror("Error", "Camera index must be an integer (0,1,2,…)")
-            return
+        new_camera_url = camera_url_entry.get().strip()
 
         new_ctrl_ip = controller_ip.get().strip()
         new_ctrl_port = controller_port.get().strip()
         new_hb_enabled = bool(hb_enable_var.get())
         new_hb_interval = hb_interval_entry.get().strip()
 
-        if not new_ctrl_ip or not new_ctrl_port:
+        if not new_camera_url or not new_ctrl_ip or not new_ctrl_port:
             messagebox.showerror("Error", "All fields are required")
             return
         if not new_ctrl_port.isdigit():
@@ -287,7 +314,7 @@ def open_admin_panel():
             messagebox.showerror("Error", "Heartbeat interval must be a positive number")
             return
 
-        camera_index_value = new_cam_idx
+        camera_url_value = new_camera_url
         controller_ip_value = new_ctrl_ip
         controller_port_value = new_ctrl_port
         heartbeat_enabled = new_hb_enabled
@@ -304,7 +331,7 @@ def open_admin_panel():
             start_camera()
 
         settings_label.config(
-            text=f"Cam idx: {camera_index_value} | Ctrl: {controller_ip_value}:{controller_port_value}"
+            text=f"RTSP: {camera_url_value}\nCtrl: {controller_ip_value}:{controller_port_value}"
         )
         messagebox.showinfo("Saved", "Settings saved successfully")
         admin.destroy()
@@ -366,7 +393,7 @@ tk.Button(left_panel, text="GUI Settings", width=20, height=2,
           font=("Arial", 12), command=open_admin_login).pack(pady=5)
 
 settings_label = tk.Label(left_panel,
-                           text=f"Cam idx: {camera_index_value} | Ctrl: {controller_ip_value}:{controller_port_value}",
+                           text=f"RTSP: {camera_url_value}\nCtrl: {controller_ip_value}:{controller_port_value}",
                            font=("Arial", 10),
                            fg="white", bg="#101820",
                            wraplength=200)
